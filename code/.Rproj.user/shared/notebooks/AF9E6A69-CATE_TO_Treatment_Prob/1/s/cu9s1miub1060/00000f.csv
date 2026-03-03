@@ -1,7 +1,0 @@
-"0","W <- seq(-2, 2, by = 0.3)"
-"0","EY1 <- 0.5 - 1 / (1 + exp(W))"
-"0","EY0 <- -0.5 + 1 / (1 + exp(W))"
-"0","CATE <- -(EY1 - EY0)"
-"0","data <- data.frame(W, CATE, se = 0.3)"
-"0","data_plot <- data %>% "
-"0","  mutate(pA = treatByCATE(CATE, se, conf_level = 0.95, Gmin = 0.1))"
