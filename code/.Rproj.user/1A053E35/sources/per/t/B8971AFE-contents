@@ -1,0 +1,807 @@
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+source(here::here("code/utils.R"))
+source(here::here("code/fun_designs.R"))
+# ==============================================================================
+# 1. 全局配置
+# ==============================================================================
+CONFIG <- list(
+  M_sims = 20,         # Monte Carlo 重复次数 (建议调试用 50-100, 最终跑 500+)
+  N_total = 2000,      # 每次实验的总样本量
+  batch_size = 400,    # 批次大小
+  weights = c(1, 1),   # A-optimality 权重
+  epsilon = 0.05       # 概率截断
+)
+
+# ==============================================================================
+# 2. 数据生成机制 (DGP)
+# ==============================================================================
+# original
+# true_params <- list(
+#   p_l1 = 0.5,
+#   p_l2_cond = function(l1, a1) {
+#     if(l1==0 & a1==0) return(0.2)
+#     if(l1==0 & a1==1) return(0.4)
+#     if(l1==1 & a1==0) return(0.6)
+#     if(l1==1 & a1==1) return(0.8)
+#   },
+#   y_dist = function(l1, a1, l2, a2) {
+#     # Mean structure
+#     mu <- 10 + 2*l1 + 3*l2 + 5*a1 + 5*a2 - 2*a1*a2
+# 
+#     # Heterogeneous Variance structure (关键点)
+#     # (A1=0, A2=1) 这条路径方差大 -> Oracle 应该分配更多样本
+#     sigma <- 1
+#     if (a1 == 0 && a2 == 1) sigma <- 5
+#     if (a1 == 1 && a2 == 1) sigma <- 1
+#     if (a1 == 0 && a2 == 0) sigma <- 0.5
+# 
+#     return(list(mu=mu, sigma=sigma))
+#   }
+# )
+
+# hard case.
+# true_params <- list(
+#   p_l1 = 0.5,
+# 
+#   # 你现在用的 p_l2_cond 也可以保留或稍微夸张一点
+#   p_l2_cond = function(l1, a1) {
+#     if (l1 == 0 && a1 == 0) return(0.15)
+#     if (l1 == 0 && a1 == 1) return(0.45)
+#     if (l1 == 1 && a1 == 0) return(0.55)
+#     if (l1 == 1 && a1 == 1) return(0.85)
+#   },
+# 
+#   y_dist = function(l1, a1, l2, a2) {
+#     ## 均值结构（可以保持你原来的，也可以用这个）
+#     mu <- 10 +
+#       2*l1 + 3*l2 +
+#       5*a1 + 5*a2 - 2*a1*a2 +
+#       3*l1*a1 +          # L1=1, A1=1: 早治疗更有效
+#       2*l2*a2            # L2=1, A2=1: 晚治疗在高风险 L2 时更有效
+# 
+#     ## 默认 sigma
+#     sigma <- 1.0
+# 
+#     ## -------- Stage 2: A1 = 0 的四个 strata 上，精确控制 Var(Y | A2=1) vs Var(Y | A2=0) --------
+#     if (a1 == 0) {
+#       if (l1 == 0 && l2 == 0) {
+#         # 想要 p*(A2=1) ≈ 0.32  -> 更倾向 A2=0
+#         if (a2 == 1) sigma <- 1.0   # sigma1
+#         if (a2 == 0) sigma <- 3.0   # sigma0
+#       } else if (l1 == 0 && l2 == 1) {
+#         # 想要 p*(A2=1) ≈ 0.81  -> 强烈倾向 A2=1
+#         if (a2 == 1) sigma <- 3.0   # sigma1
+#         if (a2 == 0) sigma <- 1.0   # sigma0
+#       } else if (l1 == 1 && l2 == 0) {
+#         # 想要 p*(A2=1) ≈ 0.74  -> 明显偏向 A2=1
+#         if (a2 == 1) sigma <- 2.0   # sigma1
+#         if (a2 == 0) sigma <- 1.0   # sigma0
+#       } else if (l1 == 1 && l2 == 1) {
+#         # 想要 p*(A2=1) ≈ 0.41  -> 略偏向 A2=0
+#         if (a2 == 1) sigma <- 1.0   # sigma1
+#         if (a2 == 0) sigma <- 2.0   # sigma0
+#       }
+#     }
+# 
+#     ## -------- A1 = 1 分支 --------
+#     ## 理论上我们的设计这里就是 s0=0 -> p≈1，用来 focus d1 rule；
+#     ## 为了数值稳定，可以让这些 sigma 不要太大，随 L1,L2 略波动
+#     if (a1 == 1) {
+#       if (a2 == 1) {
+#         sigma <- 0.8 + 0.2*l1 + 0.2*l2
+#       } else {
+#         # A1=1 且 A2=0 的 path 理论上不重要，可以给一个略大的方差但不会被大量采样
+#         sigma <- 1.2 + 0.3*l1 + 0.3*l2
+#       }
+#     }
+# 
+#     return(list(mu = mu, sigma = sigma))
+#   }
+# )
+
+# better hetero case (oracle best for minimizing EIC, not guarantee for minimizing)
+true_params <- list(
+  p_l1 = 0.5,
+  
+  # 让 L2 在 (L1,A1) 上更不对称一点
+  p_l2_cond = function(l1, a1) {
+    if(l1==0 & a1==0) return(0.2)
+    if(l1==0 & a1==1) return(0.8)   # A1=1 时 L2 更容易=1
+    if(l1==1 & a1==0) return(0.7)
+    if(l1==1 & a1==1) return(0.3)   # 这里反过来，增加不对称性
+  },
+  
+  y_dist = function(l1, a1, l2, a2) {
+    # --- 均值部分：让 timing effect 对 L1 有异质性 ---
+    # baseline
+    mu <- 8 + 2*l1 + 1.5*l2
+    
+    # A1 的效果：对 L1=0 时更大，对 L1=1 时较小
+    mu <- mu + (4 + 2*(1 - l1)) * a1   # L1=0 -> +6, L1=1 -> +4
+    
+    # A2 的效果：对 L1=1 时更大，对 L1=0 时较小
+    mu <- mu + (2 + 3*l1) * a2        # L1=0 -> +2, L1=1 -> +5
+    
+    # 适当保留一点 A1*A2 interaction
+    mu <- mu - 1.5 * a1 * a2
+    
+    # 再加一点 L2*A2 交互，让 (L2=1,A2=1) 在某些 strata 下特别重要
+    mu <- mu + 1.5 * l2 * a2
+    
+    # --- 方差部分：让 "关键 path" 随 L 变化 ---
+    sigma <- 1
+    
+    # 对 Psi2（d2 vs d3），让 L1=0 的 (A1=0,A2=1) 特别 noisy
+    if(l1==0 && a1==0 && a2==1) sigma <- 4   # 高噪声但只在 L1=0
+    
+    # 对 Psi1（d1 vs d2），让 L1=1 的 (A1=1,A2=1) 特别 noisy
+    if(l1==1 && a1==1 && a2==1) sigma <- 4   # 高噪声但只在 L1=1
+    
+    # (A1=0,A2=0) 保持比较稳定，但 L1=1 时稍微大一点
+    if(a1==0 && a2==0 && l1==0) sigma <- 0.5
+    if(a1==0 && a2==0 && l1==1) sigma <- 1.0
+    
+    # 其他 cell 维持中等噪声
+    return(list(mu=mu, sigma=sigma))
+  }
+)
+
+# 通用数据生成函数
+# g_design 可以是列表包含函数 g1, g2
+generate_data <- function(n, g_design, params) {
+  d <- data.frame(id = 1:n)
+  
+  # Stage 1
+  d$L1 <- rbinom(n, 1, params$p_l1)
+  
+  # A1
+  if(is.function(g_design$g1)) {
+    probs_a1 <- sapply(d$L1, g_design$g1)
+  } else {
+    probs_a1 <- 0.5 # Default fallback
+  }
+  d$A1 <- rbinom(n, 1, probs_a1)
+  d$prob_A1 <- ifelse(d$A1==1, probs_a1, 1-probs_a1)  # 历史随机化概率
+  
+  # Stage 2
+  probs_l2 <- mapply(params$p_l2_cond, d$L1, d$A1)
+  d$L2 <- rbinom(n, 1, probs_l2)
+  
+  # A2
+  if(is.function(g_design$g2)) {
+    probs_a2 <- mapply(g_design$g2, d$L1, d$A1, d$L2)
+  } else {
+    probs_a2 <- 0.5
+  }
+  d$A2 <- rbinom(n, 1, probs_a2)
+  d$prob_A2 <- ifelse(d$A2==1, probs_a2, 1-probs_a2)  # 历史随机化概率
+  
+  # Outcome
+  y_params <- mapply(params$y_dist, d$L1, d$A1, d$L2, d$A2, SIMPLIFY = FALSE)
+  mus <- sapply(y_params, function(x) x$mu)
+  sigmas <- sapply(y_params, function(x) x$sigma)
+  d$Y <- rnorm(n, mean = mus, sd = sigmas)
+  
+  return(d)
+}
+
+# ==============================================================================
+# 3. 核心算法组件：Q-learning, Design Update, EIC
+# ==============================================================================
+
+# 3.1 估计 Q (Cell Means)
+estimate_Q <- function(data) {
+  # P(L2 | L1, A1)
+  q_l2 <- data %>% 
+    group_by(L1, A1) %>% 
+    summarise(p_l2_1 = mean(L2), .groups='drop')
+  
+  # E[Y | L1, A1, L2, A2] & Var[Y]
+  q_y <- data %>% 
+    group_by(L1, A1, L2, A2) %>% 
+    summarise(
+      mu_y = mean(Y), 
+      var_y = var(Y),
+      n_count = n(),
+      .groups='drop'
+    )
+  
+  # Simple fill for unobserved cells (MVP only)
+  full_grid <- expand.grid(L1=0:1, A1=0:1, L2=0:1, A2=0:1)
+  q_y <- left_join(full_grid, q_y, by=c("L1","A1","L2","A2"))
+  q_y$mu_y[is.na(q_y$mu_y)] <- mean(data$Y)
+  q_y$var_y[is.na(q_y$var_y)] <- var(data$Y)
+  
+  return(list(q_l2=q_l2, q_y=q_y))
+}
+
+# 3.2 A-optimal Design 所需辅助函数
+get_var_safe <- function(models, l1, a1, l2, a2) {
+  res <- models$q_y %>% filter(L1==l1, A1==a1, L2==l2, A2==a2)
+  if(nrow(res) > 0 && !is.na(res$var_y[1])) return(res$var_y[1])
+  return(1.0)
+}
+get_pl2_safe <- function(models, l1, a1) {
+  res <- models$q_l2 %>% filter(L1==l1, A1==a1)
+  if(nrow(res) > 0 && !is.na(res$p_l2_1[1])) return(res$p_l2_1[1])
+  return(0.5)
+}
+
+# ==== NEW: 如果你在别处已经定义了 get_mu_safe，可以删掉这个并用原来的 ====
+get_mu_safe <- function(models, l1, a1, l2, a2) {
+  res <- models$q_y %>% filter(L1==l1, A1==a1, L2==l2, A2==a2)
+  if(nrow(res) > 0 && !is.na(res$mu_y[1])) {
+    return(res$mu_y[1])
+  } else {
+    return (0)
+  }
+  # # fallback：用整体均值
+  # return(mean(models$q_y$mu_y, na.rm = TRUE))
+}
+
+TRUE_PSI_ANALYTICAL <- calculate_true_psi_analytical(true_params)
+TRUE_PSI <- TRUE_PSI_ANALYTICAL
+# cat("Calculating Truth via Large Sample (N=2000)...\n")
+# large_N <- 2000
+# d_truth <- generate_data(large_N, list(g1=function(x) 0.5, g2=function(x,y,z) 0.5), true_params)
+# q_truth <- estimate_Q(d_truth)
+# eic_truth <- calculate_inference(d_truth, q_truth) # 用历史权重
+# TRUE_PSI <- TRUE_PSI_ANALYTICAL
+# cat(sprintf("True Psi1: %.4f, True Psi2: %.4f\n", TRUE_PSI[1], TRUE_PSI[2]))
+
+# cat("Calculating Oracle Design...\n")
+# oracle_design_obj <- update_design(d_truth, q_truth, CONFIG$weights, 0.01)
+# oracle_g1_func <- oracle_design_obj$g1
+# oracle_g2_func <- oracle_design_obj$g2
+
+## 2. 用 true_params 构造 q_truth（解析的 E[Y|·], Var[Y|·], P(L2|·)）
+q_truth <- build_q_truth_from_params(true_params)
+
+## 3. 基于 q_truth 做 oracle design
+cat("Calculating Oracle Design from true_params...\n")
+oracle_design_obj <- update_design(
+  accumulated_data = NULL,     # 现在其实没用到，可以给 NULL
+  current_Q        = q_truth,  # 真 Q
+  weights          = CONFIG$weights,
+  # epsilon          = 0.01
+  epsilon          = 0.05
+)
+
+oracle_g1_func <- oracle_design_obj$g1
+oracle_g2_func <- oracle_design_obj$g2
+
+# ==============================================================================
+# 7. 单次实验运行函数 (Single Simulation Run)
+# ==============================================================================
+
+run_single_experiment <- function(mode) {
+  data_acc <- data.frame()
+  
+  # -------- 1. 初始化设计 & 历史 t_g 表 --------
+  if (mode == "Naive") {
+    curr_g <- list(
+      g1 = function(x) 0.5,
+      g2 = function(x,y,z) 0.5
+    )
+    t_g1_init <- expand.grid(L1 = 0:1); t_g1_init$prob_1 <- 0.5
+    t_g2_init <- expand.grid(L1 = 0:1, A1 = 0:1, L2 = 0:1); t_g2_init$prob_1 <- 0.5
+    
+    # 注意：一开始就放进 history，保证 length(hist_g1) >= 1 且有 L1 列
+    hist_g1 <- list(t_g1_init)
+    hist_g2 <- list(t_g2_init)
+    
+  } else if (mode == "Oracle") {
+    curr_g <- list(
+      g1 = oracle_g1_func,
+      g2 = oracle_g2_func
+    )
+    # 用 oracle 的 design table 当作每一批的 design
+    t_g1_init <- oracle_design_obj$t_g1
+    t_g2_init <- oracle_design_obj$t_g2
+    
+    hist_g1 <- list(t_g1_init)
+    hist_g2 <- list(t_g2_init)
+    
+  } else if (mode == "Adaptive") {
+    curr_g <- list(
+      g1 = function(x) 0.5,
+      g2 = function(x,y,z) 0.5
+    )
+    t_g1_init <- expand.grid(L1 = 0:1); t_g1_init$prob_1 <- 0.5
+    t_g2_init <- expand.grid(L1 = 0:1, A1 = 0:1, L2 = 0:1); t_g2_init$prob_1 <- 0.5
+    
+    hist_g1 <- list(t_g1_init)
+    hist_g2 <- list(t_g2_init)
+    last_des <- list(t_g1 = t_g1_init, t_g2 = t_g2_init)
+  } else if (mode == "Adaptive_gbar_driven") {
+    # 新的：meta-level oracle-targeting 版本（方式 B）
+    curr_g <- list(g1 = function(x) 0.5,
+                   g2 = function(x,y,z) 0.5)
+    
+    # 为 gbar_driven 保存 history t_g 表
+    t_g1_init <- expand.grid(L1 = 0:1)
+    t_g1_init$prob_1 <- 0.5
+    
+    t_g2_init <- expand.grid(L1 = 0:1, A1 = 0:1, L2 = 0:1)
+    t_g2_init$prob_1 <- 0.5
+    
+    hist_g1 <- list(t_g1_init)
+    hist_g2 <- list(t_g2_init)
+    last_des <- list(t_g1 = t_g1_init, t_g2 = t_g2_init)
+  } else if (mode == "Adaptive_gbar_stabilized") {
+    # oracle 平均 benchmark 的版本（用 update_design_stabilized_avg）
+    curr_g <- list(
+      g1 = function(x) 0.5,
+      g2 = function(x,y,z) 0.5
+    )
+    t_g1_init <- expand.grid(L1 = 0:1); t_g1_init$prob_1 <- 0.5
+    t_g2_init <- expand.grid(L1 = 0:1, A1 = 0:1, L2 = 0:1); t_g2_init$prob_1 <- 0.5
+    hist_g1 <- list(t_g1_init)
+    hist_g2 <- list(t_g2_init)
+    last_des <- list(t_g1 = t_g1_init, t_g2 = t_g2_init)
+    
+    oracle_hist_g1 <- list()
+    oracle_hist_g2 <- list()
+    oracle_weights <- NULL
+    
+  } else {
+    stop("Unknown mode in run_single_experiment")
+  }
+  
+  batches <- CONFIG$N_total / CONFIG$batch_size
+  
+  # ==== NEW: 仅在 Adaptive 下记录 design 历史，用于 ḡ ====
+  # hist_g1 <- list()
+  # hist_g2 <- list()
+  # if (mode == "Adaptive") {
+  #   t_g1_init <- expand.grid(L1=0:1); t_g1_init$prob_1 <- 0.5
+  #   t_g2_init <- expand.grid(L1=0:1, A1=0:1, L2=0:1); t_g2_init$prob_1 <- 0.5
+  #   last_des <- list(t_g1 = t_g1_init, t_g2 = t_g2_init)
+  # }
+  
+  # -------- 2. 按 batch 生成数据并更新设计 --------
+  
+  for(b in 1:batches) {
+    d_batch <- generate_data(CONFIG$batch_size, curr_g, true_params)
+    d_batch$batch <- b
+    data_acc <- dplyr::bind_rows(data_acc, d_batch)
+    
+    # 如果是 gbar_driven 版本，先把当前 design 表存进 history
+    # ====== Naive / Oracle：design 不变，但 history 要补满 ======
+    if (mode %in% c("Naive", "Oracle") && b < batches) {
+      hist_g1[[b + 1]] <- t_g1_init
+      hist_g2[[b + 1]] <- t_g2_init
+    }
+    if (mode == "Adaptive"  && b < batches) {
+      # if (b == 1) {
+      #   hist_g1[[b]] <- last_des$t_g1
+      #   hist_g2[[b]] <- last_des$t_g2
+      # } else {
+      #   hist_g1[[b]] <- last_des$t_g1
+      #   hist_g2[[b]] <- last_des$t_g2
+      # }
+      q_curr <- estimate_Q(data_acc)
+      des_up <- update_design(data_acc, q_curr, CONFIG$weights, CONFIG$epsilon)
+      curr_g <- list(g1 = des_up$g1, g2 = des_up$g2)
+      last_des <- des_up
+      
+      hist_g1[[b + 1]] <- des_up$t_g1
+      hist_g2[[b + 1]] <- des_up$t_g2
+    }
+    
+    if (b < batches && mode == "Adaptive_gbar_driven") {
+      q_curr <- estimate_Q(data_acc)
+      des_up <- update_design_gbar_driven(
+        hist_g1 = hist_g1,
+        hist_g2 = hist_g2,
+        q_curr  = q_curr,
+        weights = CONFIG$weights,
+        epsilon = CONFIG$epsilon,
+        b       = b
+      )
+      curr_g <- list(g1 = des_up$g1, g2 = des_up$g2)
+      last_des <- list(t_g1 = des_up$t_g1, t_g2 = des_up$t_g2)
+      hist_g1[[b + 1]] <- des_up$t_g1
+      hist_g2[[b + 1]] <- des_up$t_g2
+    }
+    
+    if (b < batches && mode == "Adaptive_gbar_stabilized") {
+      q_curr <- estimate_Q(data_acc)
+      des_up <- update_design_stabilized_avg(
+        accumulated_data = data_acc,
+        current_Q        = q_curr,
+        weights          = CONFIG$weights,
+        epsilon          = CONFIG$epsilon,
+        hist_g1          = hist_g1,
+        hist_g2          = hist_g2,
+        oracle_hist_g1   = oracle_hist_g1,
+        oracle_hist_g2   = oracle_hist_g2,
+        oracle_weights   = oracle_weights
+      )
+      curr_g <- list(g1 = des_up$g1, g2 = des_up$g2)
+      last_des <- list(t_g1 = des_up$t_g1, t_g2 = des_up$t_g2)
+      
+      hist_g1[[b + 1]] <- des_up$t_g1
+      hist_g2[[b + 1]] <- des_up$t_g2
+      
+      oracle_hist_g1 <- des_up$oracle_hist_g1
+      oracle_hist_g2 <- des_up$oracle_hist_g2
+      oracle_weights <- des_up$oracle_weights
+    }
+  }
+  # -------- 3. 实验结束：统一算 Hist / Avg 两种 estimator --------
+  n <- nrow(data_acc)
+  
+  ## 3.1 Historical weights estimator
+  q_hist   <- estimate_Q(data_acc)
+  eic_hist <- calculate_inference(data_acc, q_hist, use_average_prob = FALSE)
+  
+  est1_hist <- mean(eic_hist$D1)
+  est2_hist <- mean(eic_hist$D2)
+  var1_hist <- var(eic_hist$D1) / n
+  var2_hist <- var(eic_hist$D2) / n
+  
+  ci1_hist <- c(est1_hist - 1.96 * sqrt(var1_hist),
+                est1_hist + 1.96 * sqrt(var1_hist))
+  ci2_hist <- c(est2_hist - 1.96 * sqrt(var2_hist),
+                est2_hist + 1.96 * sqrt(var2_hist))
+  
+  cov1_hist <- (TRUE_PSI[1] >= ci1_hist[1] && TRUE_PSI[1] <= ci1_hist[2])
+  cov2_hist <- (TRUE_PSI[2] >= ci2_hist[1] && TRUE_PSI[2] <= ci2_hist[2])
+  
+  ## 3.2 Average design estimator (所有 design 都走这一步)
+  data_acc_avg <- calculate_averaged_probs(hist_g1, hist_g2, data_acc)
+  q_avg        <- estimate_Q(data_acc_avg)
+  eic_avg      <- calculate_inference(data_acc_avg, q_avg, use_average_prob = TRUE)
+  
+  est1_avg <- mean(eic_avg$D1)
+  est2_avg <- mean(eic_avg$D2)
+  var1_avg <- var(eic_avg$D1) / n
+  var2_avg <- var(eic_avg$D2) / n
+  
+  ci1_avg <- c(est1_avg - 1.96 * sqrt(var1_avg),
+               est1_avg + 1.96 * sqrt(var1_avg))
+  ci2_avg <- c(est2_avg - 1.96 * sqrt(var2_avg),
+               est2_avg + 1.96 * sqrt(var2_avg))
+  
+  cov1_avg <- (TRUE_PSI[1] >= ci1_avg[1] && TRUE_PSI[1] <= ci1_avg[2])
+  cov2_avg <- (TRUE_PSI[2] >= ci2_avg[1] && TRUE_PSI[2] <= ci2_avg[2])
+  
+  # -------- 4. 返回，两种 estimator 都带回去 --------
+  return(data.frame(
+    Design = mode,
+    
+    Est1_Hist = est1_hist,
+    Est2_Hist = est2_hist,
+    Var1_Hist = var1_hist,
+    Var2_Hist = var2_hist,
+    Cov1_Hist = cov1_hist,
+    Cov2_Hist = cov2_hist,
+    
+    Est1_Avg  = est1_avg,
+    Est2_Avg  = est2_avg,
+    Var1_Avg  = var1_avg,
+    Var2_Avg  = var2_avg,
+    Cov1_Avg  = cov1_avg,
+    Cov2_Avg  = cov2_avg
+  ))
+  
+
+    # 生成 Batch 数据
+    # d_batch <- generate_data(CONFIG$batch_size, curr_g, true_params)
+    # d_batch$batch <- b
+    # data_acc <- bind_rows(data_acc, d_batch)
+    # 
+    # # 自适应更新设计
+    # if(mode == "Adaptive" && b < batches) {
+    #   q_curr <- estimate_Q(data_acc)
+    #   des_up <- update_design(data_acc, q_curr, CONFIG$weights, CONFIG$epsilon)
+    #   curr_g <- list(g1=des_up$g1, g2=des_up$g2)
+    #   last_des <- des_up
+    # }
+
+  # Final Q 估计
+  # q_final <- estimate_Q(data_acc)
+  # n_total <- nrow(data_acc)
+  
+  # Helper: 计算估计量 + CI + 覆盖
+  # calc_stats <- function(eic_df, true_psi) {
+  #   est <- mean(eic_df)
+  #   var_est <- var(eic_df) / n_total
+  #   se <- sqrt(var_est)
+  #   ci_low <- est - 1.96 * se
+  #   ci_upp <- est + 1.96 * se
+  #   cov <- (true_psi >= ci_low && true_psi <= ci_upp)
+  #   list(est=est, var=var_est, cov=cov)
+  # }
+  # 
+  # if (!grepl("Adaptive", mode)) {
+  #   # === Naive / Oracle：只有历史权重的 estimator（和原来完全一致） ===
+  #   eics <- calculate_inference(data_acc, q_final, use_average_prob = FALSE)
+  #   
+  #   stats1 <- calc_stats(eics$D1, TRUE_PSI[1])
+  #   stats2 <- calc_stats(eics$D2, TRUE_PSI[2])
+  #   
+  #   return(data.frame(
+  #     Design   = mode,
+  #     Estimator = "Hist",
+  #     Est_1 = stats1$est, Est_2 = stats2$est,
+  #     EstVar_1 = stats1$var, EstVar_2 = stats2$var,
+  #     Cov_1 = stats1$cov,  Cov_2 = stats2$cov
+  #   ))
+  # } else {
+    # === Adaptive：两个 estimator：Hist / Avg ===
+    
+    # # 1) 历史权重
+    # eic_hist <- calculate_inference(data_acc, q_final, use_average_prob = FALSE)
+    # stats1_hist <- calc_stats(eic_hist$D1, TRUE_PSI[1])
+    # stats2_hist <- calc_stats(eic_hist$D2, TRUE_PSI[2])
+    
+    # # 2) 平均 design 权重 ḡ
+    # data_acc_avg <- calculate_averaged_probs(hist_g1, hist_g2, data_acc)
+    # eic_avg <- calculate_inference(data_acc_avg, q_final, use_average_prob = TRUE)
+    # stats1_avg <- calc_stats(eic_avg$D1, TRUE_PSI[1])
+    # stats2_avg <- calc_stats(eic_avg$D2, TRUE_PSI[2])
+    
+    # return(rbind(
+    #   data.frame(
+    #     Design   = mode,
+    #     Estimator = "Hist",
+    #     Est_1 = stats1_hist$est, Est_2 = stats2_hist$est,
+    #     EstVar_1 = stats1_hist$var, EstVar_2 = stats2_hist$var,
+    #     Cov_1 = stats1_hist$cov,  Cov_2 = stats2_hist$cov
+    #   ),
+    #   data.frame(
+    #     Design   = mode,
+    #     Estimator = "Avg",
+    #     Est_1 = stats1_avg$est, Est_2 = stats2_avg$est,
+    #     EstVar_1 = stats1_avg$var, EstVar_2 = stats2_avg$var,
+    #     Cov_1 = stats1_avg$cov,  Cov_2 = stats2_avg$cov
+    #   )
+    # ))
+}
+
+# quick test
+# set.seed(1)
+# res_adaptive  <- run_single_experiment("Adaptive")
+# print(res_adaptive)
+
+# ==============================================================================
+# 8. Monte Carlo Loop & Report
+# ==============================================================================
+cat(sprintf("Starting Monte Carlo Simulation (M=%d)...\n", CONFIG$M_sims))
+
+library(foreach)
+library(doFuture)
+library(future)
+
+plan(multisession, workers = parallel::detectCores() - 1)
+registerDoFuture()
+
+results_list <- foreach(
+  m = 1:CONFIG$M_sims,
+  .combine = dplyr::bind_rows,
+  .packages = c("dplyr")
+) %dopar% {
+  if (m %% 10 == 0) cat(sprintf("Sim %d/%d...\n", m, CONFIG$M_sims))
+  
+  set.seed(m)
+  res_naive  <- run_single_experiment("Naive")
+  set.seed(m)
+  res_oracle <- run_single_experiment("Oracle")
+  set.seed(m)
+  res_adapt  <- run_single_experiment("Adaptive")
+  set.seed(m)
+  res_gbar_drv <- run_single_experiment("Adaptive_gbar_driven")
+  set.seed(m)
+  res_gbar_stb <- run_single_experiment("Adaptive_gbar_stabilized")
+  
+  bind_rows(res_naive, res_oracle, res_adapt, res_gbar_drv, res_gbar_stb)
+  # bind_rows(res_naive, res_oracle)
+}
+
+full_results <- bind_rows(results_list)
+
+# ==============================================================================
+# 9. 结果汇总与展示
+# ==============================================================================
+summary_table <- full_results %>%
+  group_by(Design) %>%
+  summarise(
+    # ---------------- Psi 1 ----------------
+    Truth_Psi1 = TRUE_PSI[1],
+    
+    Bias1_Hist = mean(Est1_Hist) - TRUE_PSI[1],
+    Bias1_Avg  = mean(Est1_Avg)  - TRUE_PSI[1],
+    
+    EmpVar1_Hist = var(Est1_Hist),   # Monte Carlo variance
+    EmpVar1_Avg  = var(Est1_Avg),
+    
+    AvgEstVar1_Hist = mean(Var1_Hist),  # 平均估计方差
+    AvgEstVar1_Avg  = mean(Var1_Avg),
+    
+    Coverage1_Hist = mean(Cov1_Hist),
+    Coverage1_Avg  = mean(Cov1_Avg),
+    
+    Oracle_Coverage1_Hist = mean(
+      abs(Est1_Hist - TRUE_PSI[1]) <= 1.96 * sqrt(EmpVar1_Hist)
+    ),
+    Oracle_Coverage1_Avg = mean(
+      abs(Est1_Avg  - TRUE_PSI[1]) <= 1.96 * sqrt(EmpVar1_Avg)
+    ),
+    
+    # ---------------- Psi 2 ----------------
+    Truth_Psi2 = TRUE_PSI[2],
+    
+    Bias2_Hist = mean(Est2_Hist) - TRUE_PSI[2],
+    Bias2_Avg  = mean(Est2_Avg)  - TRUE_PSI[2],
+    
+    EmpVar2_Hist = var(Est2_Hist),
+    EmpVar2_Avg  = var(Est2_Avg),
+    
+    AvgEstVar2_Hist = mean(Var2_Hist),
+    AvgEstVar2_Avg  = mean(Var2_Avg),
+    
+    Coverage2_Hist = mean(Cov2_Hist),
+    Coverage2_Avg  = mean(Cov2_Avg),
+    
+    Oracle_Coverage2_Hist = mean(
+      abs(Est2_Hist - TRUE_PSI[2]) <= 1.96 * sqrt(EmpVar2_Hist)
+    ),
+    Oracle_Coverage2_Avg = mean(
+      abs(Est2_Avg  - TRUE_PSI[2]) <= 1.96 * sqrt(EmpVar2_Avg)
+    ),
+    
+    .groups = "drop"
+  )
+
+
+# summary_table <- full_results %>%
+#   # group_by(Design, Estimator) %>%
+#   group_by(Design) %>% 
+#   summarise(
+#     Truth_Psi1 = TRUE_PSI[1],
+#     Bias_Psi1 = mean(Est_1) - TRUE_PSI[1],
+#     EmpVar_Psi1 = var(Est_1),           # Monte Carlo Variance (Sampling Var)
+#     AvgEstVar_Psi1 = mean(EstVar_1),    # Average of Estimated Variances
+#     Coverage_Psi1 = mean(Cov_1),
+#     Oracle_Coverage_Psi1 = mean(abs(Est_1 - TRUE_PSI[1]) <= 1.96*sqrt(EmpVar_Psi1)),
+#     
+#     Truth_Psi2 = TRUE_PSI[2],
+#     Bias_Psi2 = mean(Est_2) - TRUE_PSI[2],
+#     EmpVar_Psi2 = var(Est_2),
+#     AvgEstVar_Psi2 = mean(EstVar_2),
+#     Coverage_Psi2 = mean(Cov_2),
+#     Oracle_Coverage_Psi2 = mean(abs(Est_2 - TRUE_PSI[2]) <= 1.96*sqrt(EmpVar_Psi2)),
+#     .groups = "drop"
+#   )
+
+print(as.data.frame(summary_table))
+
+# 为了画图方便，构造一个组合 label
+summary_table <- summary_table %>%
+  mutate(Design_Est = paste(Design, Estimator, sep = "_"))
+
+# 可视化比较 (Boxplot of Estimates Errors)
+full_results_long <- full_results %>%
+  select(Design, Estimator, Est_1, Est_2, EstVar_1, EstVar_2, Cov_1, Cov_2) %>%
+  pivot_longer(cols=c("Est_1", "Est_2", "EstVar_1", "EstVar_2", "Cov_1","Cov_2"),
+               names_to="Param", values_to="Value")
+
+full_results_long$Truth <- ifelse(full_results_long$Param=="Est_1", TRUE_PSI[1],
+                                  ifelse(full_results_long$Param=="Est_2", TRUE_PSI[2], NA))
+full_results_long$Bias <- full_results_long$Value - full_results_long$Truth
+
+ggplot(full_results_long %>% filter(Param %in% c("Est_1","Est_2")),
+       aes(x=paste(Design,Estimator,sep="_"), y=Bias, fill=Estimator)) +
+  geom_boxplot() +
+  facet_wrap(~Param, scales = "free_y") +
+  geom_hline(yintercept=0, linetype="dashed") +
+  theme_minimal() +
+  labs(title="Bias Distribution by Design & Estimator (Monte Carlo)",
+       x="Design_Estimator", y="Estimation Error (Est - Truth)")
+
+ggplot(summary_table,
+       aes(x=Design_Est, y=CONFIG$weights[1]*EmpVar_Psi1+CONFIG$weights[2]*EmpVar_Psi2, fill=Estimator)) +
+  geom_col(position="dodge") +
+  theme_minimal() +
+  labs(title="A-optimal Weighted Variance by Design & Estimator",
+       y="w1*Var(Psi1) + w2*Var(Psi2)")
+
+ggplot(summary_table,
+       aes(x=Design_Est, y=EmpVar_Psi1, fill=Estimator)) +
+  geom_col(position="dodge") +
+  theme_minimal() +
+  labs(title="Variance of Psi1 by Design & Estimator", y="Var(Psi1)")
+
+ggplot(summary_table,
+       aes(x=Design_Est, y=EmpVar_Psi2, fill=Estimator)) +
+  geom_col(position="dodge") +
+  theme_minimal() +
+  labs(title="Variance of Psi2 by Design & Estimator", y="Var(Psi2)")
+
+
+# ==============================================================================
+# 10. Trajectory of randomization probabilities
+# ==============================================================================
+
+cat(sprintf("Starting Trajectory Simulation for Adaptive design (M=%d)...\n", CONFIG$M_sims))
+
+traj_all <- foreach(
+  m = 1:CONFIG$M_sims,
+  .combine = dplyr::bind_rows,
+  .packages = c("dplyr")
+) %dopar% {
+  # 为了和主 simulation 对齐，可以用同一个 seed 规则
+  set.seed(m)
+  df <- track_adaptive_prob_traj_by_strata(seed = m)
+  df$Sim <- m
+  df
+}
+
+traj_summary <- traj_all %>%
+  dplyr::group_by(stage, batch, L1, A1, L2) %>%
+  dplyr::summarise(
+    prob_adapt_mean = mean(prob_1_adapt),
+    prob_avg_mean   = mean(prob_1_avg),
+    prob_oracle     = mean(prob_1_oracle),
+    prob_naive      = mean(prob_1_naive),
+    dist_adapt_mean = mean(dist_adapt_oracle),
+    dist_avg_mean   = mean(dist_avg_oracle),
+    dist_naive_mean = mean(dist_naive_oracle),
+    .groups = "drop"
+  )
+
+traj_stage1 <- traj_summary %>% dplyr::filter(stage == 1)
+
+p_stage1_prob <- ggplot(traj_stage1, aes(x = batch)) +
+  geom_line(aes(y = prob_adapt_mean, colour = "Adaptive")) +
+  geom_line(aes(y = prob_avg_mean,   colour = "Average of Adaptive")) +
+  geom_line(aes(y = prob_oracle,     colour = "Oracle")) +
+  geom_line(aes(y = prob_naive,      colour = "Naive"), linetype = "dashed") +
+  facet_wrap(~ L1, labeller = label_bquote(L[1] == .(L1))) +
+  labs(
+    title = "Stage 1: P(A1=1 | L1) trajectories (MC averaged)",
+    x = "Batch index",
+    y = "P(A1=1 | L1)"
+  ) +
+  theme_minimal() +
+  scale_colour_manual(values = c(
+    "Adaptive"   = "black",
+    "Average of Adaptive" = "blue",
+    "Oracle"     = "red",
+    "Naive"      = "grey50"
+  ))
+
+p_stage1_prob
+
+traj_stage2 <- traj_summary %>%
+  dplyr::filter(stage == 2) %>%
+  dplyr::mutate(
+    stratum = paste0("L1=", L1, ", A1=", A1, ", L2=", L2)
+  )
+
+p_stage2_prob <- ggplot(traj_stage2, aes(x = batch)) +
+  geom_line(aes(y = prob_adapt_mean, colour = "Adaptive")) +
+  geom_line(aes(y = prob_avg_mean,   colour = "Average ḡ")) +
+  geom_line(aes(y = prob_oracle,     colour = "Oracle")) +
+  geom_line(aes(y = prob_naive,      colour = "Naive"), linetype = "dashed") +
+  facet_wrap(~ stratum) +
+  labs(
+    title = "Stage 2: P(A2=1 | L1,A1,L2) trajectories (MC averaged)",
+    x = "Batch index",
+    y = "P(A2=1 | L1,A1,L2)"
+  ) +
+  theme_minimal() +
+  scale_colour_manual(values = c(
+    "Adaptive"   = "black",
+    "Average of Adaptivē" = "blue",
+    "Oracle"     = "red",
+    "Naive"      = "grey50"
+  ))
+
+p_stage2_prob
+
