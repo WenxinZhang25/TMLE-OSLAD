@@ -2,6 +2,7 @@
 
 library(dplyr)
 library(here)
+library(hash)
 library(ggplot2)
 source(here("code/utils/CATE_helper.R"))
 here()
