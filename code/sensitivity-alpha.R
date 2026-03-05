@@ -1,6 +1,8 @@
 # Sensitivity analysis of the choice of alpha in CATE CI
+
 library(dplyr)
 library(here)
+library(ggplot2)
 library(hash)
 here()
 sim_name <- "DGD_hetero_d1"

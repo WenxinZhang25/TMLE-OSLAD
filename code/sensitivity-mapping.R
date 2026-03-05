@@ -1,6 +1,8 @@
 # Sensitivity analysis on different mapping functions from CATE to treatment probability
+
 library(dplyr)
 library(here)
+library(ggplot2)
 source(here("code/utils/CATE_helper.R"))
 here()
 sim_name <- "DGD_hetero_d1"
@@ -37,6 +39,12 @@ oslad_designs <- c(
   "Non-adaptive randomization", 
   paste0(rep("Adaptive design (based on surrogate Y", length(S_tp)), S_tp, ")"),
   "Adaptive design (based on final outcome Y5)")
+
+design_levels <- c(paste0(
+  rep("Adaptive design (based on surrogate Y", length(S_tp)), S_tp, ")"),
+  "Adaptive design (based on final outcome Y5)",
+  "Adaptive design (TMLE-OSLAD)",
+  "Non-adaptive randomization")
 
 design_colors <- setNames(design_colors, 
                           c(design_levels[1:length(SY_tp)],
