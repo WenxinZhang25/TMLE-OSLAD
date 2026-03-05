@@ -1,8 +1,8 @@
 # An Online Meta-Level Adaptive Design Framework with Targeted Learning Inference: Applications to Evaluating and Utilizing Surrogate Outcomes in Adaptive Designs
 
-This directory contains the implementation of the paper "An Online Meta-Level Adaptive-Design Framework with Targeted Learning Inference: Applications to Evaluating and Utilizing Surrogate Outcomes in Adaptive Designs". The code to implement the method and obtain results in the main paper and appendix is in `code/`, and the data used in the extended simulation study is in `data/`. All commands should be run from the repository root directory.
+This directory contains the implementation of the paper "An Online Meta-Level Adaptive Design Framework with Targeted Learning Inference: Applications to Evaluating and Utilizing Surrogate Outcomes in Adaptive Designs". The code to implement the method and obtain results in the main paper and appendix is in `code/`, and the data used in the extended simulation study is in `data/`. All commands should be run from the repository root directory.
 
-## 1. Run simulation
+## 1. Run simulations
 
 ### Step 1.1
 Copy and run sbatch scripts in the commented lines in `simulation.sh`. Each job creates a folder in `output/Results/` to store raw simulation outputs for the corresponding simulation scenario.
