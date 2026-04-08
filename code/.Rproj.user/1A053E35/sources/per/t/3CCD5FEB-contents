@@ -1,0 +1,347 @@
+# ==============================================================================
+# 追踪 Adaptive design 的 g_k / ḡ_k 在各个 strata 上的轨迹
+#   - 只跑 Adaptive 一条轨迹（指定 seed）
+#   - 对每个 batch、每个 strata 记录：
+#       * 当前自适应 design 的 P(A_k=1 | strata)
+#       * 平均 design ḡ 的 P̄(A_k=1 | strata)
+#       * Oracle design (通过 oracle_g1_func / oracle_g2_func)
+#       * Naive design (=0.5)
+#       * 与 Oracle 的距离（绝对差）
+#   - Stage 1 strata: L1 ∈ {0,1}
+#   - Stage 2 strata: (L1 ∈ {0,1}, A1 ∈ {0,1}, L2 ∈ {0,1})
+# ==============================================================================
+
+track_adaptive_prob_traj_by_strata <- function(seed = 1) {
+  set.seed(seed)
+  
+  batches <- CONFIG$N_total / CONFIG$batch_size
+  
+  # 初始设计: Naive
+  curr_g <- list(
+    g1 = function(x) 0.5,
+    g2 = function(x, y, z) 0.5
+  )
+  
+  # 初始 design table (用于 history)
+  t_g1_init <- expand.grid(L1 = 0:1)
+  t_g1_init$prob_1 <- 0.5
+  
+  t_g2_init <- expand.grid(L1 = 0:1, A1 = 0:1, L2 = 0:1)
+  t_g2_init$prob_1 <- 0.5
+  
+  last_des <- list(t_g1 = t_g1_init, t_g2 = t_g2_init)
+  hist_g1 <- list()
+  hist_g2 <- list()
+  
+  # 轨迹结果：长格式 data.frame
+  traj_list <- list()
+  
+  data_acc <- data.frame()
+  
+  for (b in 1:batches) {
+    # 1. 记录当前 batch 使用的 design 表到 history
+    hist_g1[[b]] <- last_des$t_g1
+    hist_g2[[b]] <- last_des$t_g2
+    
+    # 2. 生成这一批数据（用当前自适应 design）
+    d_batch <- generate_data(CONFIG$batch_size, curr_g, true_params)
+    
+    # 3. 基于 1..b 的 history，计算当前 ḡ 的 strata-level 概率
+    # --- Stage 1: ḡ1 ---
+    avg_g1_b <- dplyr::bind_rows(hist_g1[1:b]) %>%
+      dplyr::group_by(L1) %>%
+      dplyr::summarise(prob_1_avg = mean(prob_1), .groups = "drop")
+    
+    # --- Stage 2: ḡ2 ---
+    avg_g2_b <- dplyr::bind_rows(hist_g2[1:b]) %>%
+      dplyr::group_by(L1, A1, L2) %>%
+      dplyr::summarise(prob_1_avg = mean(prob_1), .groups = "drop")
+    
+    # ========================
+    # Stage 1 strata: L1
+    # ========================
+    grid_h1 <- expand.grid(L1 = 0:1)
+    
+    # 当前 Adaptive design 的 g1 概率（来自 last_des$t_g1）
+    g1_curr <- dplyr::left_join(
+      grid_h1,
+      last_des$t_g1,
+      by = "L1"
+    ) %>%
+      dplyr::rename(prob_1_adapt = prob_1)
+    
+    # 平均 design ḡ1 的概率
+    g1_curr <- dplyr::left_join(
+      g1_curr,
+      avg_g1_b,
+      by = "L1"
+    ) %>%
+      dplyr::rename(prob_1_avg = prob_1_avg)
+    
+    # Oracle design 的 g1 概率（用 oracle_g1_func）
+    g1_curr$prob_1_oracle <- oracle_g1_func(g1_curr$L1)
+    
+    # Naive design 恒为 0.5
+    g1_curr$prob_1_naive <- 0.5
+    
+    # 与 Oracle 的距离（绝对差）
+    g1_curr <- g1_curr %>%
+      dplyr::mutate(
+        stage = 1L,
+        batch = b,
+        A1 = NA_integer_,
+        L2 = NA_integer_,
+        dist_adapt_oracle = abs(prob_1_adapt  - prob_1_oracle),
+        dist_avg_oracle   = abs(prob_1_avg    - prob_1_oracle),
+        dist_naive_oracle = abs(prob_1_naive  - prob_1_oracle)
+      )
+    
+    # ========================
+    # Stage 2 strata: (L1, A1, L2)
+    # ========================
+    grid_h2 <- expand.grid(L1 = 0:1, A1 = 0:1, L2 = 0:1)
+    
+    # 当前 Adaptive g2
+    g2_curr <- dplyr::left_join(
+      grid_h2,
+      last_des$t_g2,
+      by = c("L1", "A1", "L2")
+    ) %>%
+      dplyr::rename(prob_1_adapt = prob_1)
+    
+    # 平均 design ḡ2
+    g2_curr <- dplyr::left_join(
+      g2_curr,
+      avg_g2_b,
+      by = c("L1", "A1", "L2")
+    ) %>%
+      dplyr::rename(prob_1_avg = prob_1_avg)
+    
+    # Oracle g2（用 oracle_g2_func）
+    g2_curr$prob_1_oracle <- oracle_g2_func(g2_curr$L1, g2_curr$A1, g2_curr$L2)
+    
+    # Naive
+    g2_curr$prob_1_naive <- 0.5
+    
+    g2_curr <- g2_curr %>%
+      dplyr::mutate(
+        stage = 2L,
+        batch = b,
+        dist_adapt_oracle = abs(prob_1_adapt  - prob_1_oracle),
+        dist_avg_oracle   = abs(prob_1_avg    - prob_1_oracle),
+        dist_naive_oracle = abs(prob_1_naive  - prob_1_oracle)
+      )
+    
+    # 4. 收集这一 batch 的所有 strata 信息
+    traj_list[[b]] <- dplyr::bind_rows(g1_curr, g2_curr)
+    
+    # 5. 累积数据并更新 design
+    d_batch$batch <- b
+    data_acc <- dplyr::bind_rows(data_acc, d_batch)
+    
+    if (b < batches) {
+      q_curr <- estimate_Q(data_acc)
+      des_up <- update_design(data_acc, q_curr, CONFIG$weights, CONFIG$epsilon)
+      curr_g <- list(g1 = des_up$g1, g2 = des_up$g2)
+      last_des <- des_up
+    }
+  }
+  
+  traj_df <- dplyr::bind_rows(traj_list)
+  return(traj_df)
+}
+
+# ==============================================================================
+# 4. [NEW] 计算平均概率 (Averaged Probability ḡ)
+# ==============================================================================
+
+calculate_averaged_probs <- function(history_g1_tables, history_g2_tables, data) {
+  
+  if (is.null(history_g1_tables) || length(history_g1_tables) == 0) {
+    stop("calculate_averaged_probs: history_g1_tables is empty; 请检查 run_single_experiment 是否正确填充 hist_g1。")
+  }
+  if (is.null(history_g2_tables) || length(history_g2_tables) == 0) {
+    stop("calculate_averaged_probs: history_g2_tables is empty; 请检查 run_single_experiment 是否正确填充 hist_g2。")
+  }
+  
+  # Stage 1: 所有 batch 的 g1 表合并求均值
+  all_g1 <- bind_rows(history_g1_tables)
+  avg_g1 <- all_g1 %>%
+    group_by(L1) %>%
+    summarise(mean_prob_1 = mean(prob_1), .groups='drop')
+  
+  # Stage 2: 所有 batch 的 g2 表合并求均值
+  all_g2 <- bind_rows(history_g2_tables)
+  avg_g2 <- all_g2 %>%
+    group_by(L1, A1, L2) %>%
+    summarise(mean_prob_1 = mean(prob_1), .groups='drop')
+  
+  # 映射回数据
+  
+  # G1
+  data <- data %>%
+    left_join(avg_g1, by="L1") %>%
+    rename(avg_prob_1_val = mean_prob_1)  # 这是 P̄(A1=1 | L1)
+  
+  # 实际动作对应的平均概率 P̄(A1 = a1 | L1)
+  data$prob_A1_avg <- ifelse(data$A1 == 1, data$avg_prob_1_val, 1 - data$avg_prob_1_val)
+  
+  # G2
+  data <- data %>%
+    left_join(avg_g2, by=c("L1", "A1", "L2")) %>%
+    rename(avg_prob_2_val = mean_prob_1)  # 这是 P̄(A2=1 | L1,A1,L2)
+  
+  # 实际动作对应的平均概率 P̄(A2 = a2 | history)
+  data$prob_A2_avg <- ifelse(data$A2 == 1, data$avg_prob_2_val, 1 - data$avg_prob_2_val)
+  
+  data <- data %>% select(-avg_prob_1_val, -avg_prob_2_val)
+  
+  return(data)
+}
+
+# ==============================================================================
+# 5. 推断函数 (支持历史 / 平均两种权重)
+# ==============================================================================
+
+calculate_inference <- function(data, Q_models, use_average_prob = FALSE) {
+  
+  # 选择使用哪一列作为权重
+  p1_col <- if (use_average_prob) "prob_A1_avg" else "prob_A1"
+  p2_col <- if (use_average_prob) "prob_A2_avg" else "prob_A2"
+  
+  ### 12/04 Cheating
+  # Q_models <- q_truth
+  # Helper
+  get_mu <- function(l1, a1, l2, a2) {
+    r <- Q_models$q_y %>% filter(L1==l1, A1==a1, L2==l2, A2==a2)
+    if(nrow(r)==0) return(0) else return(r$mu_y[1])
+  }
+  get_p_l2 <- function(l1, a1) {
+    r <- Q_models$q_l2 %>% filter(L1==l1, A1==a1)
+    if(nrow(r)==0) return(0.5) else return(r$p_l2_1[1])
+  }
+  
+  # Pre-compute m2 vector
+  data$m2_d1 <- mapply(function(l1,a1,l2) get_mu(l1,a1,l2,1), data$L1, data$A1, data$L2)
+  data$m2_d2 <- data$m2_d1 # d2 also A2=1
+  data$m2_d3 <- mapply(function(l1,a1,l2) get_mu(l1,a1,l2,0), data$L1, data$A1, data$L2)
+  
+  # Calc m1 (Expectation over L2)
+  calc_m1 <- function(l1, rule_a1, rule_a2) {
+    p <- get_p_l2(l1, rule_a1)
+    v1 <- get_mu(l1, rule_a1, 1, rule_a2)
+    v0 <- get_mu(l1, rule_a1, 0, rule_a2)
+    return(v1*p + v0*(1-p))
+  }
+  
+  # Calculate D_efficient for a single row
+  get_D_tau <- function(tau, row) {
+    # row 是 apply + as.list 给的 list
+    l1 <- row[["L1"]]; a1 <- row[["A1"]]; l2 <- row[["L2"]]; a2 <- row[["A2"]]; y <- row[["Y"]]
+    p1 <- row[[p1_col]]; p2 <- row[[p2_col]]
+    
+    # Tau=1: d1(1,1) vs d2(0,1)
+    # Tau=2: d2(0,1) vs d3(0,0)
+    rule_u_a1 <- if(tau==1) 1 else 0
+    rule_u_a2 <- 1
+    
+    rule_v_a1 <- 0
+    rule_v_a2 <- if(tau==1) 1 else 0
+    
+    # m2 values (observed L2)
+    m2_u <- if(rule_u_a2==1) row[["m2_d1"]] else row[["m2_d3"]]
+    m2_v <- if(rule_v_a2==1) row[["m2_d2"]] else row[["m2_d3"]]
+    
+    # m1 values (integrated L2)
+    m1_u <- calc_m1(l1, rule_u_a1, rule_u_a2)
+    m1_v <- calc_m1(l1, rule_v_a1, rule_v_a2)
+    
+    # Component 1: Main effect + Stage 1 Adjustment
+    D1_term <- (m1_u - m1_v)
+    if(a1 == rule_u_a1) D1_term <- D1_term + (m2_u - m1_u)/p1
+    if(a1 == rule_v_a1) D1_term <- D1_term - (m2_v - m1_v)/p1
+    
+    # Component 2: Stage 2 Adjustment
+    D2_term <- 0
+    if(a1 == rule_u_a1 && a2 == rule_u_a2) D2_term <- D2_term + (y - m2_u)/(p1*p2)
+    if(a1 == rule_v_a1 && a2 == rule_v_a2) D2_term <- D2_term - (y - m2_v)/(p1*p2)
+    
+    return(D1_term + D2_term)
+  }
+  
+  d1_vals <- apply(data, 1, function(r) get_D_tau(1, as.list(r)))
+  d2_vals <- apply(data, 1, function(r) get_D_tau(2, as.list(r)))
+  
+  return(data.frame(D1=d1_vals, D2=d2_vals))
+}
+
+# ==============================================================================
+# 6. Truth Calculation & Oracle Design Setup
+# ==============================================================================
+
+calculate_true_psi_analytical <- function(params) {
+  # 计算 E[Y_(a1,a2)] 并得到 Psi1, Psi2
+  
+  calc_expectation <- function(fix_a1, fix_a2) {
+    expected_value <- 0
+    for(l1 in 0:1) {
+      prob_l1 <- if(l1 == 1) params$p_l1 else (1 - params$p_l1)
+      p_l2_given_l1_a1 <- params$p_l2_cond(l1, fix_a1)
+      for(l2 in 0:1) {
+        prob_l2 <- if(l2 == 1) p_l2_given_l1_a1 else (1 - p_l2_given_l1_a1)
+        y_dist_params <- params$y_dist(l1, fix_a1, l2, fix_a2)
+        mu_y <- y_dist_params$mu
+        expected_value <- expected_value + (mu_y * prob_l2 * prob_l1)
+      }
+    }
+    return(expected_value)
+  }
+  
+  E_Y_d1 <- calc_expectation(1, 1)
+  E_Y_d2 <- calc_expectation(0, 1)
+  E_Y_d3 <- calc_expectation(0, 0)
+  
+  true_psi1 <- E_Y_d1 - E_Y_d2
+  true_psi2 <- E_Y_d2 - E_Y_d3
+  
+  cat(sprintf("Analytical Truth:\n"))
+  cat(sprintf("  E[Y_d1] (1,1): %.4f\n", E_Y_d1))
+  cat(sprintf("  E[Y_d2] (0,1): %.4f\n", E_Y_d2))
+  cat(sprintf("  E[Y_d3] (0,0): %.4f\n", E_Y_d3))
+  cat(sprintf("-----------------------\n"))
+  cat(sprintf("  True Psi 1: %.6f\n", true_psi1))
+  cat(sprintf("  True Psi 2: %.6f\n", true_psi2))
+  
+  return(c(true_psi1, true_psi2))
+}
+
+
+build_q_truth_from_params <- function(params) {
+  # 1) q_l2: P(L2=1 | L1, A1)
+  q_l2 <- expand.grid(L1 = 0:1, A1 = 0:1) %>%
+    dplyr::rowwise() %>%
+    dplyr::mutate(
+      p_l2_1 = params$p_l2_cond(L1, A1)
+    ) %>%
+    dplyr::ungroup()
+  
+  # 2) q_y: E[Y | L1, A1, L2, A2] & Var[Y | ...]
+  q_y <- expand.grid(L1 = 0:1, A1 = 0:1, L2 = 0:1, A2 = 0:1) %>%
+    dplyr::rowwise() %>%
+    dplyr::mutate(
+      tmp = list(params$y_dist(L1, A1, L2, A2)),
+      mu_y = tmp$mu,
+      var_y = tmp$sigma^2
+    ) %>%
+    dplyr::select(-tmp) %>%
+    dplyr::ungroup()
+  
+  # 3) global_mu: 有些 get_mu_safe 用它做 fallback，这里随便给个合理值
+  global_mu <- mean(q_y$mu_y)
+  
+  return(list(
+    q_l2 = q_l2,
+    q_y  = q_y,
+    global_mu = global_mu
+  ))
+}
